@@ -1,0 +1,341 @@
+
+-- Copyright (c) 2018, G.A. vd. Hoorn
+--
+-- Licensed under the Apache License, Version 2.0 (the "License");
+-- you may not use this file except in compliance with the License.
+-- You may obtain a copy of the License at
+--
+--     http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing, software
+-- distributed under the License is distributed on an "AS IS" BASIS,
+-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-- See the License for the specific language governing permissions and
+-- limitations under the License.
+
+
+PROGRAM fdpm_mdemo
+--------------------------------------------------------------------------------
+--
+-- A simple Dynamic Path Modification demo using Model DPM to control a Fanuc
+-- with a mouse in 3D.
+--
+-- author: G.A. vd. Hoorn
+--
+--------------------------------------------------------------------------------
+%ALPHABETIZE
+%COMMENT = 'FDPMMD//r0b'
+%NOLOCKGROUP
+%NOPAUSE = COMMAND + TPENABLE + ERROR
+
+
+
+
+--------------------------------------------------------------------------------
+--
+-- remote types & constants
+--
+--------------------------------------------------------------------------------
+%INCLUDE include\libssock.th
+
+
+
+
+--------------------------------------------------------------------------------
+--
+-- local types & constants
+--
+--------------------------------------------------------------------------------
+TYPE
+	dpmm_cfg_t = STRUCTURE
+		f_tp_ready   : INTEGER
+		f_krl_ready  : INTEGER
+		s_tcp_port   : INTEGER  -- TCP port to listen on
+		s_tag_nr     : INTEGER  -- server TAG number to use
+		um_clear     : BOOLEAN  -- clear user menu on start
+	ENDSTRUCTURE
+
+
+	dpmm_t = STRUCTURE
+		sock         : ssock_t      -- server socket instance
+		shutdwn_req  : BOOLEAN      -- program abort requested status
+	ENDSTRUCTURE
+
+
+
+
+CONST
+	LOG_PFIX     = 'FDMD '
+
+	COND_AH      = 4242  -- ABORT handler id (randomly chosen, but less
+	                     -- likely to clash than simply '1')
+
+	CFG_OK       =    0  -- config ok
+	CFG_NOTDONE  =   -1  -- configuration not checked: user action required
+
+	FILE_ILL_PRM =  2032 -- FILE-032 Illegal parameter
+	HOST_CTAG_ER = 67144 -- HOST-144 Comm Tag error
+	SEV_ABORT    =    2  -- ABORT severity
+
+	RACCEPT_DLAY = 1000  -- 'return to sock_accept' delay
+
+
+
+
+--------------------------------------------------------------------------------
+--
+-- local variables
+--
+--------------------------------------------------------------------------------
+VAR
+	cfg_         IN SHADOW : dpmm_cfg_t   -- configuration
+	this_                  : dpmm_t       -- prog instance
+
+	sock_fd_               : FILE         -- file descriptor associated with srvr socket
+	stat_                  : INTEGER      -- status variable
+
+
+
+
+--------------------------------------------------------------------------------
+--
+-- remote routine prototypes
+--
+--------------------------------------------------------------------------------
+%INCLUDE include\libssock.h
+%INCLUDE include\libind_log.h
+
+
+
+
+--------------------------------------------------------------------------------
+--
+-- local routine prototypes
+--
+--------------------------------------------------------------------------------
+ROUTINE hndl_client_(this : dpmm_t; fd : FILE) : INTEGER FROM fdpm_mdemo
+
+ROUTINE check_cfg_(cfg : dpmm_cfg_t) : INTEGER FROM fdpm_mdemo
+
+ROUTINE set_offs_(dx : REAL; dy : REAL; dz : REAL) : INTEGER FROM fdpm_mdemo
+
+ROUTINE is_dpm_mpty_ : BOOLEAN FROM fdpm_mdemo
+
+
+
+
+--------------------------------------------------------------------------------
+--
+-- Main program
+--
+--------------------------------------------------------------------------------
+BEGIN
+	-- check config
+	stat_ = check_cfg_(cfg_)
+	IF (stat_ <> CFG_OK) THEN
+		log_error_a(LOG_PFIX + 'cfg error:', stat_)
+		log_error(LOG_PFIX + 'check cfg')
+		-- errors with config always force user to log window
+		log_force
+		POST_ERR(FILE_ILL_PRM, '', 0, SEV_ABORT)
+		RETURN
+	ENDIF
+
+
+	-- TODO: should check DPM config is ok
+
+
+	stat_              = 0
+	this_.shutdwn_req  = FALSE
+
+
+	-- enable log output
+	IF (cfg_.um_clear) THEN log_clear; ENDIF
+
+
+	-- init server socket
+	stat_ = ssock_ctor(this_.sock, cfg_.s_tcp_port, cfg_.s_tag_nr)
+	IF (stat_ <> 0) THEN
+		IF (stat_ = TAG_CONF_ERR) THEN
+			log_error_a(LOG_PFIX + 'cfg err, TAG idx:', cfg_.s_tag_nr)
+		ELSE
+			log_error_a(LOG_PFIX + 'ssock_ctor err:', stat_)
+		ENDIF
+		-- nothing we can do, abort
+		POST_ERR(HOST_CTAG_ER, '', 0, SEV_ABORT)
+	ENDIF
+
+
+	-- make sure socket is closed (don't care about result)
+	stat_ = ssock_dconnf(this_.sock)
+
+
+	log_info(LOG_PFIX + 'init done')
+
+	-- handshake with TP prog:
+	--  1) wait for TP program to tell us that it's ready
+	log_info(LOG_PFIX + 'wait TP')
+	WAIT FOR (FLG[cfg_.f_tp_ready] = ON)
+
+
+	-- TODO: make sure and wait for DPM to be ready
+
+
+	--  2) tell TP prog we are ready
+	log_info(LOG_PFIX + 'TP is ready')
+	FLG[cfg_.f_krl_ready] = ON
+
+
+	-- handle clients
+	WHILE (NOT this_.shutdwn_req) DO
+		-- inform user
+		log_info(LOG_PFIX + 'wait client')
+
+		-- we need binary mode (UnFormatted)
+		SET_FILE_ATR(sock_fd_, ATR_UF)
+
+		-- wait for connection
+		CLR_IO_STAT(sock_fd_)
+		stat_ = ssock_accpt2(this_.sock, sock_fd_)
+		IF (stat_ <> 0) THEN
+			-- can't continue on any error
+			log_error_a(LOG_PFIX + 'sock_accept err:', stat_)
+			this_.shutdwn_req = TRUE
+			GOTO lbl_m_break1
+		ENDIF
+
+		-- inform user
+		log_info(LOG_PFIX + 'connected')
+
+		-- client connected, 'spin-off' connection handler
+		stat_ = hndl_client_(this_, sock_fd_)
+
+		-- TODO: handle client errors properly
+
+	lbl_m_break1::
+		stat_ = ssock_dconn2(this_.sock, sock_fd_)
+
+	lbl_m_cont0::
+		log_info(LOG_PFIX + 'disconnected')
+
+		-- always delay returning to accept() a bit, to make sure user can
+		-- escape runaway loops
+		DELAY (RACCEPT_DLAY)
+
+	-- /WHILE (NOT this.shutdwn_req)
+	ENDWHILE
+
+	-- make sure socket is closed (don t care about result)
+	stat_ = ssock_dconnf(this_.sock)
+	log_info(LOG_PFIX + 'exit')
+END fdpm_mdemo
+
+
+
+
+ROUTINE hndl_client_
+VAR
+	stat__       : INTEGER
+	dx__         : REAL
+	dy__         : REAL
+	dz__         : REAL
+BEGIN
+	stat__       = 0
+	dx__         = 0.0
+	dy__         = 0.0
+	dz__         = 0.0
+
+	log_info(LOG_PFIX + 'ready for mouse input')
+
+	-- service connected client
+	WHILE (NOT this.shutdwn_req) DO
+
+		-- wait for new offsets (essentially 'forever' as READ blocks)
+		READ fd(dx__, dy__, dz__)
+		stat__ = IO_STATUS(fd)
+		IF (stat__ <> 0) THEN
+			log_error_a(LOG_PFIX + 'sock err:', stat__)
+			GOTO lbl_hc_break
+		ENDIF
+
+		IF (NOT is_dpm_mpty_) THEN
+			-- DPM hasn't copied previous offsets yet, try again next iteration
+			-- with new offsets (net effect: ignore the currently received
+			-- offsets, but since everything is relative, this shouldn't
+			-- matter that much for user experience)
+			GOTO lbl_hc_cont1
+		ENDIF
+
+		-- push offsets into sysvars
+		stat__ = set_offs_(dx__, dy__, dz__)
+		IF (stat__ <> 0) THEN POST_ERR(-stat__, '', 0, SEV_ABORT); ENDIF
+
+	lbl_hc_cont1::
+		-- just yield
+		DELAY (1)
+
+	-- /WHILE (NOT this.shutdwn_req)
+	ENDWHILE
+
+lbl_hc_break::
+	log_info(LOG_PFIX + 'hndl_client exit')
+
+	RETURN (-ABS(stat__))
+END hndl_client_
+
+
+
+
+ROUTINE check_cfg_
+BEGIN
+	-- check for any uninitialised entries
+	IF (UNINIT(cfg.f_tp_ready )) THEN RETURN (CFG_NOTDONE); ENDIF
+	IF (UNINIT(cfg.f_krl_ready)) THEN RETURN (CFG_NOTDONE); ENDIF
+	IF (UNINIT(cfg.s_tcp_port )) THEN RETURN (CFG_NOTDONE); ENDIF
+	IF (UNINIT(cfg.s_tag_nr   )) THEN RETURN (CFG_NOTDONE); ENDIF
+	IF (UNINIT(cfg.um_clear   )) THEN RETURN (CFG_NOTDONE); ENDIF
+
+	-- all ok
+	RETURN (CFG_OK)
+END check_cfg_
+
+
+
+
+ROUTINE set_offs_
+VAR
+	stat__       : INTEGER
+BEGIN
+	stat__ = 0
+
+	SET_VAR(0, '*SYSTEM*', '$DPM_SCH[1].$GRP[1].$OFS[1].$INI_OFS', dx, stat__)
+	IF (stat__ <> 0) THEN GOTO lbl_so_exit; ENDIF
+	SET_VAR(0, '*SYSTEM*', '$DPM_SCH[1].$GRP[1].$OFS[2].$INI_OFS', dy, stat__)
+	IF (stat__ <> 0) THEN GOTO lbl_so_exit; ENDIF
+	SET_VAR(0, '*SYSTEM*', '$DPM_SCH[1].$GRP[1].$OFS[3].$INI_OFS', dz, stat__)
+	IF (stat__ <> 0) THEN GOTO lbl_so_exit; ENDIF
+
+lbl_so_exit::
+	RETURN (-ABS(stat__))
+END set_offs_
+
+
+
+
+ROUTINE is_dpm_mpty_
+VAR
+	stat__       : INTEGER
+	temp0__      : REAL
+	temp1__      : REAL
+	temp2__      : REAL
+BEGIN
+	stat__ = 0
+	GET_VAR(0, '*SYSTEM*', '$DPM_SCH[1].$GRP[1].$OFS[1].$INI_OFS', temp0__, stat__)
+	IF (stat__ <> 0) THEN POST_ERR(stat__, '', 0, SEV_ABORT); ENDIF
+	GET_VAR(0, '*SYSTEM*', '$DPM_SCH[1].$GRP[1].$OFS[2].$INI_OFS', temp1__, stat__)
+	IF (stat__ <> 0) THEN POST_ERR(stat__, '', 0, SEV_ABORT); ENDIF
+	GET_VAR(0, '*SYSTEM*', '$DPM_SCH[1].$GRP[1].$OFS[3].$INI_OFS', temp2__, stat__)
+	IF (stat__ <> 0) THEN POST_ERR(stat__, '', 0, SEV_ABORT); ENDIF
+
+	RETURN ((temp0__ = 0.0) AND (temp1__ = 0.0) AND (temp2__ = 0.0))
+END is_dpm_mpty_
