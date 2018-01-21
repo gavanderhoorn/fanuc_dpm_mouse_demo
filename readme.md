@@ -7,6 +7,8 @@ in Modal mode with Stationary Tracking inputting offsets via system variables
 to control the end-effector in 3D (XYZ) with mouse inputs from a remote
 system.
 
+![example](https://user-images.githubusercontent.com/4550046/35197068-e7acf79c-feda-11e7-834a-964029e318e5.gif)
+
 
 ## NOTICE
 
